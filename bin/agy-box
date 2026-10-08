@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+#
+# agy-box - Run Antigravity CLI in an isolated Docker container with YOLO mode
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+IMAGE_NAME="${AGY_DOCKER_IMAGE:-agy-sandbox:latest}"
+
+show_help() {
+  cat << 'EOF'
+Usage:
+  agy-box [options] <workspace-dir> [agy arguments...]
+
+Arguments:
+  <workspace-dir>   Path to the directory you want to mount and work on.
+  [agy arguments]   Additional arguments forwarded to `agy`.
+
+Options:
+  --build           Build or rebuild the Docker container image before running.
+  -h, --help        Show this help message.
+
+Environment Variables:
+  AGY_API_KEY       Optional API key for Antigravity (or read from host config).
+  AGY_BASE_URL      Optional custom base URL for the backend API.
+  AGY_CONFIG_DIR    Optional host directory to persist Antigravity CLI state/config
+                    (Defaults to ~/.gemini/antigravity-cli on host).
+  AGY_DOCKER_IMAGE  Override the Docker image tag (default: agy-sandbox:latest).
+
+Examples:
+  agy-box ./my-project
+  agy-box /Users/me/repos/my-app -m "Gemini 3.8 Flash (Medium)"
+  agy-box --build /Users/me/repos/my-app
+EOF
+}
+
+# Check for --build flag
+BUILD_FIRST=0
+if [[ "${1:-}" == "--build" ]]; then
+  BUILD_FIRST=1
+  shift
+fi
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 1 ]]; then
+  show_help
+  exit 0
+fi
+
+HOST_WORKSPACE_DIR="$1"
+shift
+
+# Resolve absolute path for workspace directory
+if [[ ! -d "${HOST_WORKSPACE_DIR}" ]]; then
+  echo "Error: Directory '${HOST_WORKSPACE_DIR}' does not exist." >&2
+  exit 1
+fi
+RESOLVED_WORKSPACE="$(cd "${HOST_WORKSPACE_DIR}" && pwd)"
+
+# Build image if requested or if it doesn't exist
+if [[ ${BUILD_FIRST} -eq 1 ]] || ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+  echo "==> Building Docker image: ${IMAGE_NAME}..."
+  docker build -t "${IMAGE_NAME}" "${REPO_ROOT}"
+fi
+
+# Detect configuration / credentials source
+DEFAULT_HOST_CONFIG="${HOME}/.gemini/antigravity-cli"
+CONFIG_DIR="${AGY_CONFIG_DIR:-${DEFAULT_HOST_CONFIG}}"
+DOCKER_CONFIG_MOUNTS=()
+
+if [[ -d "${CONFIG_DIR}" ]]; then
+  DOCKER_CONFIG_MOUNTS+=("-v" "${CONFIG_DIR}:/home/developer/.gemini/antigravity-cli")
+fi
+
+# Forward ~/.gemini/config if available on host so project states work
+if [[ -d "${HOME}/.gemini/config" ]]; then
+  DOCKER_CONFIG_MOUNTS+=("-v" "${HOME}/.gemini/config:/home/developer/.gemini/config")
+fi
+
+# Forward OAuth token file if available on the host
+if [[ -f "${HOME}/.gemini/jetski-standalone-oauth-token" ]]; then
+  DOCKER_CONFIG_MOUNTS+=("-v" "${HOME}/.gemini/jetski-standalone-oauth-token:/home/developer/.gemini/jetski-standalone-oauth-token:ro")
+fi
+if [[ -f "${HOME}/.gemini/oauth_creds.json" ]]; then
+  DOCKER_CONFIG_MOUNTS+=("-v" "${HOME}/.gemini/oauth_creds.json:/home/developer/.gemini/oauth_creds.json:ro")
+fi
+
+# Forward environment variables if set
+ENV_FLAGS=()
+if [[ -n "${AGY_API_KEY:-}" ]]; then
+  ENV_FLAGS+=("-e" "AGY_API_KEY=${AGY_API_KEY}")
+fi
+if [[ -n "${AGY_BASE_URL:-}" ]]; then
+  ENV_FLAGS+=("-e" "AGY_BASE_URL=${AGY_BASE_URL}")
+fi
+
+# Determine terminal flags: only allocate TTY if attached to a terminal
+DOCKER_TTY_FLAGS=()
+if [ -t 0 ] && [ -t 1 ]; then
+  DOCKER_TTY_FLAGS+=("-it")
+else
+  DOCKER_TTY_FLAGS+=("-i")
+fi
+
+# Determine arguments to forward to agy
+# Default to YOLO mode (--dangerously-skip-permissions)
+AGY_ARGS=()
+if [[ $# -eq 0 ]]; then
+  AGY_ARGS=("--dangerously-skip-permissions")
+else
+  # If the user supplied arguments, check if --dangerously-skip-permissions is already present
+  HAS_YOLO=0
+  for arg in "$@"; do
+    if [[ "$arg" == "--dangerously-skip-permissions" ]]; then
+      HAS_YOLO=1
+      break
+    fi
+  done
+  if [[ ${HAS_YOLO} -eq 0 ]]; then
+    AGY_ARGS=("--dangerously-skip-permissions" "$@")
+  else
+    AGY_ARGS=("$@")
+  fi
+fi
+
+# Run the container securely:
+# - Drop all root privileges by running as container user
+# - Restrict host access: only mount the target workspace directory and config
+# - Use --security-opt=no-new-privileges:true for sandbox safety
+DOCKER_CMD=(
+  docker run --rm
+  "${DOCKER_TTY_FLAGS[@]}"
+  --security-opt=no-new-privileges:true
+  --user "$(id -u):$(id -g)"
+  -v "${RESOLVED_WORKSPACE}:/workspace"
+)
+
+if [[ ${#DOCKER_CONFIG_MOUNTS[@]} -gt 0 ]]; then
+  DOCKER_CMD+=("${DOCKER_CONFIG_MOUNTS[@]}")
+fi
+
+if [[ ${#ENV_FLAGS[@]} -gt 0 ]]; then
+  DOCKER_CMD+=("${ENV_FLAGS[@]}")
+fi
+
+DOCKER_CMD+=(
+  -e HOME=/home/developer -w /workspace
+  "${IMAGE_NAME}"
+  "${AGY_ARGS[@]}"
+)
+
+exec "${DOCKER_CMD[@]}"
